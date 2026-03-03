@@ -53,6 +53,62 @@ def get_quantization_policy():
     return None
 
 
+def patch_model_ledger_for_caching(model_ledger):
+    """Patch ModelLedger to cache loaded models instead of creating new instances each time."""
+    original_text_encoder = model_ledger.text_encoder
+    original_video_encoder = model_ledger.video_encoder
+    original_transformer = model_ledger.transformer
+    original_video_decoder = model_ledger.video_decoder
+    original_audio_decoder = model_ledger.audio_decoder
+    original_vocoder = model_ledger.vocoder
+    original_spatial_upsampler = model_ledger.spatial_upsampler
+    
+    def cached_text_encoder():
+        if not hasattr(model_ledger, '_cached_text_encoder'):
+            model_ledger._cached_text_encoder = original_text_encoder()
+        return model_ledger._cached_text_encoder
+    
+    def cached_video_encoder():
+        if not hasattr(model_ledger, '_cached_video_encoder'):
+            model_ledger._cached_video_encoder = original_video_encoder()
+        return model_ledger._cached_video_encoder
+    
+    def cached_transformer():
+        if not hasattr(model_ledger, '_cached_transformer'):
+            model_ledger._cached_transformer = original_transformer()
+        return model_ledger._cached_transformer
+    
+    def cached_video_decoder():
+        if not hasattr(model_ledger, '_cached_video_decoder'):
+            model_ledger._cached_video_decoder = original_video_decoder()
+        return model_ledger._cached_video_decoder
+    
+    def cached_audio_decoder():
+        if not hasattr(model_ledger, '_cached_audio_decoder'):
+            model_ledger._cached_audio_decoder = original_audio_decoder()
+        return model_ledger._cached_audio_decoder
+    
+    def cached_vocoder():
+        if not hasattr(model_ledger, '_cached_vocoder'):
+            model_ledger._cached_vocoder = original_vocoder()
+        return model_ledger._cached_vocoder
+    
+    def cached_spatial_upsampler():
+        if not hasattr(model_ledger, '_cached_spatial_upsampler'):
+            model_ledger._cached_spatial_upsampler = original_spatial_upsampler()
+        return model_ledger._cached_spatial_upsampler
+    
+    model_ledger.text_encoder = cached_text_encoder
+    model_ledger.video_encoder = cached_video_encoder
+    model_ledger.transformer = cached_transformer
+    model_ledger.video_decoder = cached_video_decoder
+    model_ledger.audio_decoder = cached_audio_decoder
+    model_ledger.vocoder = cached_vocoder
+    model_ledger.spatial_upsampler = cached_spatial_upsampler
+    
+    logger.info("ModelLedger patched for caching")
+
+
 def initialize_pipeline():
     global pipeline
     with pipeline_lock:
@@ -71,6 +127,8 @@ def initialize_pipeline():
                 loras=[],
                 quantization=get_quantization_policy(),
             )
+            
+            patch_model_ledger_for_caching(pipeline.model_ledger)
             
             gc.collect()
             if torch.cuda.is_available():
@@ -110,6 +168,7 @@ def warm():
 
 
 @app.route("/generatevideo", methods=["POST"])
+@torch.inference_mode()
 def generate():
     """
     Generate a video from a prompt.
