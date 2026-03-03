@@ -6,16 +6,16 @@ Supports both Text-to-Video (T2V) and Text+Image-to-Video (TI2V).
 import logging
 import os
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
-import torch
 from flask import Flask, jsonify, request
 
 from ltx_core.model.video_vae import TilingConfig, get_video_chunks_number
 from ltx_core.quantization import QuantizationPolicy
 from ltx_pipelines.distilled import DistilledPipeline
 from ltx_pipelines.utils.constants import AUDIO_SAMPLE_RATE
+from ltx_pipelines.utils.media_io import encode_video
 
 logging.getLogger().setLevel(logging.INFO)
 logger = logging.getLogger(__name__)
@@ -89,7 +89,7 @@ def warm():
         return jsonify({"error": str(e)}), 500
 
 
-@app.route("/generate", methods=["POST"])
+@app.route("/generatevideo", methods=["POST"])
 def generate():
     """
     Generate a video from a prompt.
@@ -98,3 +98,91 @@ def generate():
     
     Request body (JSON):
     {
+        "prompt": "A beautiful sunset over the ocean",  # required
+        "seed": 10,                                     # optional, default: 10
+        "height": 1024,                                 # optional, default: 1024
+        "width": 1536,                                  # optional, default: 1536
+        "num_frames": 121,                              # optional, default: 121
+        "frame_rate": 24.0,                             # optional, default: 24.0
+        "enhance_prompt": false,                        # optional, default: false
+        "output_filename": "output.mp4",                # optional, default: output_{seed}.mp4
+        
+        // Image conditioning (TI2V) - leave empty for T2V
+        "images": [
+            {"path": "/path/to/image.jpg", "frame_idx": 0, "strength": 0.8}
+        ]
+    }
+    """
+    if pipeline is None:
+        initialize_pipeline()
+
+    data = request.get_json() or {}
+    prompt = data.get("prompt", "A beautiful sunset over the ocean")
+    seed = data.get("seed", config.default_seed)
+    height = data.get("height", config.default_height)
+    width = data.get("width", config.default_width)
+    num_frames = data.get("num_frames", config.default_num_frames)
+    frame_rate = data.get("frame_rate", config.default_frame_rate)
+    enhance_prompt = data.get("enhance_prompt", False)
+
+    images_raw = data.get("images", [])
+    images: list[tuple[str, int, float]] = []
+    mode = "t2v"
+    
+    if images_raw:
+        mode = "ti2v"
+        for img in images_raw:
+            path = img.get("path")
+            frame_idx = img.get("frame_idx", 0)
+            strength = img.get("strength", 0.8)
+            if path:
+                images.append((path, frame_idx, strength))
+
+    output_filename = data.get("output_filename", f"output_{seed}.mp4")
+    output_path = Path(config.output_dir) / output_filename
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        tiling_config = TilingConfig.default()
+        video_chunks_number = get_video_chunks_number(num_frames, tiling_config)
+
+        video, audio = pipeline(
+            prompt=prompt,
+            seed=seed,
+            height=height,
+            width=width,
+            num_frames=num_frames,
+            frame_rate=frame_rate,
+            images=images,
+            tiling_config=tiling_config,
+            enhance_prompt=enhance_prompt,
+        )
+
+        encode_video(
+            video=video,
+            fps=frame_rate,
+            audio=audio,
+            audio_sample_rate=AUDIO_SAMPLE_RATE,
+            output_path=str(output_path),
+            video_chunks_number=video_chunks_number,
+        )
+
+        return jsonify({
+            "status": "success",
+            "output_path": str(output_path),
+            "prompt": prompt,
+            "seed": seed,
+            "mode": mode,
+            "images": images if mode == "ti2v" else [],
+        })
+    except Exception as e:
+        logger.exception("Failed to generate video")
+        return jsonify({"error": str(e)}), 500
+
+
+if __name__ == "__main__":
+    if config.auto_load:
+        logger.info("Auto-loading pipeline on startup...")
+        initialize_pipeline()
+    
+    app.run(host="0.0.0.0", port=5000, debug=False)
