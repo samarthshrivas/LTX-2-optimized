@@ -1,252 +1,97 @@
 """
-Flask server for the DistilledPipeline with model hot-loading.
-Supports both Text-to-Video (T2V) and Text+Image-to-Video (TI2V).
+Flask server for the DistilledPipeline.
 """
 
-import gc
 import logging
 import os
-import threading
-from dataclasses import dataclass
+import subprocess
+import uuid
 from pathlib import Path
 
-import torch
 from flask import Flask, jsonify, request, send_file
-
-from ltx_core.model.video_vae import TilingConfig, get_video_chunks_number
-from ltx_core.quantization import QuantizationPolicy
-from ltx_pipelines.distilled import DistilledPipeline
-from ltx_pipelines.utils.constants import AUDIO_SAMPLE_RATE
-from ltx_pipelines.utils.media_io import encode_video
 
 logging.getLogger().setLevel(logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
+CHECKPOINT_PATH = os.environ.get("CHECKPOINT_PATH", "/tmp/ltx-2-19b-distilled-fp8.safetensors")
+GEMMA_ROOT = os.environ.get("GEMMA_ROOT", "/tmp/gemma")
+SPATIAL_UPSAMPLER_PATH = os.environ.get("SPATIAL_UPSAMPLER_PATH", "/tmp/ltx-2-spatial-upscaler-x2-1.0.safetensors")
+OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "./outputs")
+QUANTIZATION = os.environ.get("QUANTIZATION", "fp8-cast")
 
-@dataclass
-class ServerConfig:
-    checkpoint_path: str = os.environ.get("CHECKPOINT_PATH", "/tmp/ltx-2-19b-distilled-fp8.safetensors")
-    gemma_root: str = os.environ.get("GEMMA_ROOT", "/tmp/gemma")
-    spatial_upsampler_path: str = os.environ.get("SPATIAL_UPSAMPLER_PATH", "/tmp/ltx-2-spatial-upscaler-x2-1.0.safetensors")
-    output_dir: str = os.environ.get("OUTPUT_DIR", "./outputs")
-    quantization: str = os.environ.get("QUANTIZATION", "fp8-cast")
-    default_height: int = 1024
-    default_width: int = 1536
-    default_num_frames: int = 121
-    default_frame_rate: float = 24.0
-    default_seed: int = 10
-    auto_load: bool = True
+DEFAULT_HEIGHT = 1024
+DEFAULT_WIDTH = 1536
+DEFAULT_NUM_FRAMES = 121
+DEFAULT_FRAME_RATE = 24.0
+DEFAULT_SEED = 10
 
-
-config = ServerConfig()
-pipeline: DistilledPipeline | None = None
-pipeline_lock = threading.Lock()
-
-
-def get_quantization_policy():
-    if config.quantization == "fp8-cast":
-        return QuantizationPolicy.fp8_cast()
-    elif config.quantization == "fp8-scaled-mm":
-        return QuantizationPolicy.fp8_scaled_mm()
-    return None
-
-
-def patch_model_ledger_for_caching(model_ledger):
-    """Patch ModelLedger to cache loaded models instead of creating new instances each time."""
-    original_text_encoder = model_ledger.text_encoder
-    original_video_encoder = model_ledger.video_encoder
-    original_transformer = model_ledger.transformer
-    original_video_decoder = model_ledger.video_decoder
-    original_audio_decoder = model_ledger.audio_decoder
-    original_vocoder = model_ledger.vocoder
-    original_spatial_upsampler = model_ledger.spatial_upsampler
-    
-    def cached_text_encoder():
-        if not hasattr(model_ledger, '_cached_text_encoder'):
-            model_ledger._cached_text_encoder = original_text_encoder()
-        return model_ledger._cached_text_encoder
-    
-    def cached_video_encoder():
-        if not hasattr(model_ledger, '_cached_video_encoder'):
-            model_ledger._cached_video_encoder = original_video_encoder()
-        return model_ledger._cached_video_encoder
-    
-    def cached_transformer():
-        if not hasattr(model_ledger, '_cached_transformer'):
-            model_ledger._cached_transformer = original_transformer()
-        return model_ledger._cached_transformer
-    
-    def cached_video_decoder():
-        if not hasattr(model_ledger, '_cached_video_decoder'):
-            model_ledger._cached_video_decoder = original_video_decoder()
-        return model_ledger._cached_video_decoder
-    
-    def cached_audio_decoder():
-        if not hasattr(model_ledger, '_cached_audio_decoder'):
-            model_ledger._cached_audio_decoder = original_audio_decoder()
-        return model_ledger._cached_audio_decoder
-    
-    def cached_vocoder():
-        if not hasattr(model_ledger, '_cached_vocoder'):
-            model_ledger._cached_vocoder = original_vocoder()
-        return model_ledger._cached_vocoder
-    
-    def cached_spatial_upsampler():
-        if not hasattr(model_ledger, '_cached_spatial_upsampler'):
-            model_ledger._cached_spatial_upsampler = original_spatial_upsampler()
-        return model_ledger._cached_spatial_upsampler
-    
-    model_ledger.text_encoder = cached_text_encoder
-    model_ledger.video_encoder = cached_video_encoder
-    model_ledger.transformer = cached_transformer
-    model_ledger.video_decoder = cached_video_decoder
-    model_ledger.audio_decoder = cached_audio_decoder
-    model_ledger.vocoder = cached_vocoder
-    model_ledger.spatial_upsampler = cached_spatial_upsampler
-    
-    logger.info("ModelLedger patched for caching")
-
-
-def initialize_pipeline():
-    global pipeline
-    with pipeline_lock:
-        if pipeline is None:
-            logger.info("Initializing DistilledPipeline...")
-            
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                torch.cuda.synchronize()
-            
-            pipeline = DistilledPipeline(
-                checkpoint_path=config.checkpoint_path,
-                spatial_upsampler_path=config.spatial_upsampler_path,
-                gemma_root=config.gemma_root,
-                loras=[],
-                quantization=get_quantization_policy(),
-            )
-            
-            patch_model_ledger_for_caching(pipeline.model_ledger)
-            
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            
-            logger.info("DistilledPipeline initialized successfully")
-    return pipeline
+output_dir = Path(OUTPUT_DIR)
+output_dir.mkdir(parents=True, exist_ok=True)
 
 
 @app.route("/health", methods=["GET"])
 def health():
-    memory_info = {}
-    if torch.cuda.is_available():
-        memory_info = {
-            "cuda_allocated": torch.cuda.memory_allocated() / 1024**3,
-            "cuda_reserved": torch.cuda.memory_reserved() / 1024**3,
-        }
-    return jsonify({
-        "status": "healthy",
-        "pipeline_loaded": pipeline is not None,
-        "memory": memory_info,
-    })
-
-
-@app.route("/warm", methods=["POST"])
-def warm():
-    """Keep the model hot by preloading it."""
-    try:
-        initialize_pipeline()
-        return jsonify({
-            "status": "warmed",
-            "message": "Pipeline is ready",
-        })
-    except Exception as e:
-        logger.exception("Failed to warm up pipeline")
-        return jsonify({"error": str(e)}), 500
+    return jsonify({"status": "healthy"})
 
 
 @app.route("/generatevideo", methods=["POST"])
-@torch.inference_mode()
-def generate():
-    """
-    Generate a video from a prompt.
-    
-    Supports both T2V (text-only) and TI2V (text + image conditioning).
-    
-    Request body (JSON):
-    {
-        "prompt": "A beautiful sunset over the ocean",  # required
-        "seed": 10,                                     # optional, default: 10
-        "height": 1024,                                 # optional, default: 1024
-        "width": 1536,                                  # optional, default: 1536
-        "num_frames": 121,                              # optional, default: 121
-        "frame_rate": 24.0,                             # optional, default: 24.0
-        "enhance_prompt": false,                        # optional, default: false
-        "output_filename": "output.mp4",                # optional, default: output_{seed}.mp4
-        
-        // Image conditioning (TI2V) - leave empty for T2V
-        "images": [
-            {"path": "/path/to/image.jpg", "frame_idx": 0, "strength": 0.8}
-        ]
-    }
-    
-    Response: Raw video file (MP4) as binary download.
-    """
-    if pipeline is None:
-        initialize_pipeline()
-
+def generatevideo():
     data = request.get_json() or {}
+
     prompt = data.get("prompt", "A beautiful sunset over the ocean")
-    seed = data.get("seed", config.default_seed)
-    height = data.get("height", config.default_height)
-    width = data.get("width", config.default_width)
-    num_frames = data.get("num_frames", config.default_num_frames)
-    frame_rate = data.get("frame_rate", config.default_frame_rate)
+    seed = data.get("seed", DEFAULT_SEED)
+    height = data.get("height", DEFAULT_HEIGHT)
+    width = data.get("width", DEFAULT_WIDTH)
+    num_frames = data.get("num_frames", DEFAULT_NUM_FRAMES)
+    frame_rate = data.get("frame_rate", DEFAULT_FRAME_RATE)
     enhance_prompt = data.get("enhance_prompt", False)
 
-    images_raw = data.get("images", [])
-    images: list[tuple[str, int, float]] = []
-    mode = "t2v"
-    
-    if images_raw:
-        mode = "ti2v"
-        for img in images_raw:
-            path = img.get("path")
-            frame_idx = img.get("frame_idx", 0)
-            strength = img.get("strength", 0.8)
-            if path:
-                images.append((path, frame_idx, strength))
+    images = data.get("images", [])
 
-    output_filename = data.get("output_filename", f"output_{seed}.mp4")
-    output_path = Path(config.output_dir) / output_filename
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_filename = data.get("output_filename", f"{uuid.uuid4()}.mp4")
+    output_path = output_dir / output_filename
+
+    cmd = [
+        "python", "-m", "ltx_pipelines.distilled",
+        "--checkpoint-path", CHECKPOINT_PATH,
+        "--gemma-root", GEMMA_ROOT,
+        "--spatial-upsampler-path", SPATIAL_UPSAMPLER_PATH,
+        "--prompt", prompt,
+        "--seed", str(seed),
+        "--height", str(height),
+        "--width", str(width),
+        "--num-frames", str(num_frames),
+        "--frame-rate", str(frame_rate),
+        "--output-path", str(output_path),
+    ]
+
+    if QUANTIZATION:
+        cmd.extend(["--quantization", QUANTIZATION])
+
+    if enhance_prompt:
+        cmd.append("--enhance-prompt")
+
+    for img in images:
+        img_path = img.get("path")
+        frame_idx = img.get("frame_idx", 0)
+        strength = img.get("strength", 0.8)
+        if img_path:
+            cmd.extend(["--image", img_path, str(frame_idx), str(strength)])
+
+    logger.info(f"Running: {' '.join(cmd)}")
 
     try:
-        tiling_config = TilingConfig.default()
-        video_chunks_number = get_video_chunks_number(num_frames, tiling_config)
-
-        video, audio = pipeline(
-            prompt=prompt,
-            seed=seed,
-            height=height,
-            width=width,
-            num_frames=num_frames,
-            frame_rate=frame_rate,
-            images=images,
-            tiling_config=tiling_config,
-            enhance_prompt=enhance_prompt,
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=True,
         )
 
-        encode_video(
-            video=video,
-            fps=frame_rate,
-            audio=audio,
-            audio_sample_rate=AUDIO_SAMPLE_RATE,
-            output_path=str(output_path),
-            video_chunks_number=video_chunks_number,
-        )
+        if not output_path.exists():
+            return jsonify({"error": "Output file not created", "stderr": result.stderr}), 500
 
         return send_file(
             output_path,
@@ -254,20 +99,13 @@ def generate():
             as_attachment=True,
             download_name=output_filename,
         )
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Error: {e.stderr}")
+        return jsonify({"error": e.stderr}), 500
     except Exception as e:
-        logger.exception("Failed to generate video")
-        memory_info = {}
-        if torch.cuda.is_available():
-            memory_info = {
-                "cuda_allocated": torch.cuda.memory_allocated() / 1024**3,
-                "cuda_reserved": torch.cuda.memory_reserved() / 1024**3,
-            }
-        return jsonify({"error": str(e), "memory": memory_info}), 500
+        logger.exception("Error")
+        return jsonify({"error": str(e)}), 500
 
 
 if __name__ == "__main__":
-    if config.auto_load:
-        logger.info("Auto-loading pipeline on startup...")
-        initialize_pipeline()
-    
     app.run(host="0.0.0.0", port=5000, debug=False)
