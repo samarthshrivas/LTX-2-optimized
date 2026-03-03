@@ -30,6 +30,9 @@ DEFAULT_SEED = 10
 output_dir = Path(OUTPUT_DIR)
 output_dir.mkdir(parents=True, exist_ok=True)
 
+temp_dir = Path("/tmp/ltx-server-uploads")
+temp_dir.mkdir(parents=True, exist_ok=True)
+
 
 @app.route("/health", methods=["GET"])
 def health():
@@ -38,20 +41,30 @@ def health():
 
 @app.route("/generatevideo", methods=["POST"])
 def generatevideo():
-    data = request.get_json() or {}
+    prompt = request.form.get("prompt", "A beautiful sunset over the ocean")
+    seed = int(request.form.get("seed", DEFAULT_SEED))
+    height = int(request.form.get("height", DEFAULT_HEIGHT))
+    width = int(request.form.get("width", DEFAULT_WIDTH))
+    num_frames = int(request.form.get("num_frames", DEFAULT_NUM_FRAMES))
+    frame_rate = float(request.form.get("frame_rate", DEFAULT_FRAME_RATE))
+    enhance_prompt = request.form.get("enhance_prompt", "false").lower() == "true"
 
-    prompt = data.get("prompt", "A beautiful sunset over the ocean")
-    seed = data.get("seed", DEFAULT_SEED)
-    height = data.get("height", DEFAULT_HEIGHT)
-    width = data.get("width", DEFAULT_WIDTH)
-    num_frames = data.get("num_frames", DEFAULT_NUM_FRAMES)
-    frame_rate = data.get("frame_rate", DEFAULT_FRAME_RATE)
-    enhance_prompt = data.get("enhance_prompt", False)
-
-    images = data.get("images", [])
-
-    output_filename = data.get("output_filename", f"{uuid.uuid4()}.mp4")
+    output_filename = request.form.get("output_filename", f"{uuid.uuid4()}.mp4")
     output_path = output_dir / output_filename
+
+    uploaded_files = request.files.getlist("images")
+    
+    image_args = []
+    for i, uploaded_file in enumerate(uploaded_files):
+        if uploaded_file and uploaded_file.filename:
+            ext = Path(uploaded_file.filename).suffix
+            temp_path = temp_dir / f"{uuid.uuid4()}{ext}"
+            uploaded_file.save(temp_path)
+            
+            frame_idx = request.form.get(f"images[{i}][frame_idx]", 0)
+            strength = request.form.get(f"images[{i}][strength]", 0.8)
+            
+            image_args.extend(["--image", str(temp_path), str(frame_idx), str(strength)])
 
     cmd = [
         "python", "-m", "ltx_pipelines.distilled",
@@ -73,12 +86,7 @@ def generatevideo():
     if enhance_prompt:
         cmd.append("--enhance-prompt")
 
-    for img in images:
-        img_path = img.get("path")
-        frame_idx = img.get("frame_idx", 0)
-        strength = img.get("strength", 0.8)
-        if img_path:
-            cmd.extend(["--image", img_path, str(frame_idx), str(strength)])
+    cmd.extend(image_args)
 
     logger.info(f"Running: {' '.join(cmd)}")
 
@@ -89,6 +97,10 @@ def generatevideo():
             text=True,
             check=True,
         )
+
+        for arg in image_args:
+            if arg.startswith(str(temp_dir)):
+                Path(arg).unlink(missing_ok=True)
 
         if not output_path.exists():
             return jsonify({"error": "Output file not created", "stderr": result.stderr}), 500
