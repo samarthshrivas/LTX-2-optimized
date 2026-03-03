@@ -3,13 +3,15 @@ Flask server for the DistilledPipeline with model hot-loading.
 Supports both Text-to-Video (T2V) and Text+Image-to-Video (TI2V).
 """
 
+import gc
 import logging
 import os
 import threading
 from dataclasses import dataclass
 from pathlib import Path
 
-from flask import Flask, jsonify, request
+import torch
+from flask import Flask, jsonify, request, send_file
 
 from ltx_core.model.video_vae import TilingConfig, get_video_chunks_number
 from ltx_core.quantization import QuantizationPolicy
@@ -56,6 +58,12 @@ def initialize_pipeline():
     with pipeline_lock:
         if pipeline is None:
             logger.info("Initializing DistilledPipeline...")
+            
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+            
             pipeline = DistilledPipeline(
                 checkpoint_path=config.checkpoint_path,
                 spatial_upsampler_path=config.spatial_upsampler_path,
@@ -63,15 +71,27 @@ def initialize_pipeline():
                 loras=[],
                 quantization=get_quantization_policy(),
             )
+            
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
             logger.info("DistilledPipeline initialized successfully")
     return pipeline
 
 
 @app.route("/health", methods=["GET"])
 def health():
+    memory_info = {}
+    if torch.cuda.is_available():
+        memory_info = {
+            "cuda_allocated": torch.cuda.memory_allocated() / 1024**3,
+            "cuda_reserved": torch.cuda.memory_reserved() / 1024**3,
+        }
     return jsonify({
         "status": "healthy",
         "pipeline_loaded": pipeline is not None,
+        "memory": memory_info,
     })
 
 
@@ -112,6 +132,8 @@ def generate():
             {"path": "/path/to/image.jpg", "frame_idx": 0, "strength": 0.8}
         ]
     }
+    
+    Response: Raw video file (MP4) as binary download.
     """
     if pipeline is None:
         initialize_pipeline()
@@ -167,17 +189,21 @@ def generate():
             video_chunks_number=video_chunks_number,
         )
 
-        return jsonify({
-            "status": "success",
-            "output_path": str(output_path),
-            "prompt": prompt,
-            "seed": seed,
-            "mode": mode,
-            "images": images if mode == "ti2v" else [],
-        })
+        return send_file(
+            output_path,
+            mimetype="video/mp4",
+            as_attachment=True,
+            download_name=output_filename,
+        )
     except Exception as e:
         logger.exception("Failed to generate video")
-        return jsonify({"error": str(e)}), 500
+        memory_info = {}
+        if torch.cuda.is_available():
+            memory_info = {
+                "cuda_allocated": torch.cuda.memory_allocated() / 1024**3,
+                "cuda_reserved": torch.cuda.memory_reserved() / 1024**3,
+            }
+        return jsonify({"error": str(e), "memory": memory_info}), 500
 
 
 if __name__ == "__main__":
